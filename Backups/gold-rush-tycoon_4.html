@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Gold Rush Tycoon</title>
+<style>
+:root{--rock:#2b1d14;--gold:#ffc83d;--gold2:#e8962a;--ink:#fff4dc;--bad:#6b5a4c}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+html,body{margin:0;height:100%;background:#120b07;color:var(--ink);font:600 14px/1.2 "Trebuchet MS","Segoe UI",sans-serif;overflow:hidden}
+#app{width:100vw;height:100vh;height:100dvh;margin:0;display:flex;flex-direction:column;background:var(--rock)}
+#hud{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;background:linear-gradient(#4a2f1c,#3a2415);border-bottom:3px solid #1b110a}
+#cash{font-size:26px;font-weight:900;color:var(--gold);text-shadow:0 2px 0 #7a3f0c;min-width:150px}
+#rate{font-size:12px;opacity:.8;display:block;font-weight:600;color:var(--ink);text-shadow:none}
+#hud .sp{flex:1}
+button{font:inherit;color:#3b1d05;border:0;border-radius:8px;padding:6px 10px;cursor:pointer;background:linear-gradient(#ffd96b,var(--gold2));box-shadow:0 3px 0 #8a4d0e;transition:transform .08s}
+button:active{transform:translateY(2px);box-shadow:0 1px 0 #8a4d0e}
+button.dis{background:var(--bad);color:#c9b8a8;box-shadow:0 3px 0 #3a2f27}
+button.alt{background:linear-gradient(#9be27a,#4fa23a);box-shadow:0 3px 0 #2c6320;color:#10300a}
+button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+#mine{flex:1;overflow-y:auto;overflow-x:hidden}
+#world{position:relative}
+#cv{position:absolute;left:0;top:0;pointer-events:none}
+#rows{position:relative}
+.row{height:100px;position:relative;cursor:pointer}
+.grp{position:absolute;display:flex;gap:6px}
+.grp button{font-size:11px;line-height:1.25;padding:4px 3px;min-height:40px}
+.grp .up{width:78px}.grp .mg{width:62px}
+.g-s{right:10px;top:26px}.g-e,.g-w{left:0;top:0}   /* building button groups are positioned from JS (see placeBtns) */
+.act{position:absolute;left:50%;top:26px;transform:translateX(-35%);min-width:170px;min-height:44px;font-size:13px}
+#modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6);z-index:5}
+#modal.on{display:flex}
+#box{background:#34241a;border:3px solid var(--gold2);border-radius:14px;padding:20px;max-width:340px;text-align:center;display:flex;flex-direction:column;gap:12px}
+#box h2{margin:0;color:var(--gold);font-size:22px}
+#box .bt{display:flex;gap:8px;justify-content:center}
+@media (max-width:560px){#cash{font-size:22px}.act{transform:translateX(-50%);min-width:150px}}
+@media (prefers-reduced-motion:reduce){button{transition:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="hud">
+    <div id="cash"></div>
+    <div class="sp"></div>
+    <button id="bmode">Buy x1</button>
+    <button id="bad" class="alt">Watch ad: 2x cash</button>
+    <button id="bpre">Reinvest</button>
+  </div>
+  <div id="mine"><div id="world"><canvas id="cv"></canvas><div id="rows"></div></div></div>
+</div>
+<div id="modal"><div id="box"></div></div>
+
+<script src="https://sdk.crazygames.com/crazygames-sdk-v3.js" onerror="void 0"></script>
+<script>
+"use strict";
+/* ---------- constants & helpers ---------- */
+const RH = 100, EX = 56, CYC = 15, MAXS = 30, FREE = 10, B = 4.5, SAVE = "goldRushTycoon_v2";
+const SURF_FRAC = 0.5, SURF_MIN = 150, ELEV_SHIFT = 0.1;   // surface (row 0) height = this fraction of the visible mine viewport, never below SURF_MIN px
+// live layout (recomputed every frame by layout()): SH = surface height = top y of shaft 1, sw = elevator shaft width,
+// sx = elevator shaft centre x, tl = x where the tunnels start (right edge of the shaft)
+const L = { SH: 200, s0: 200, sw: 64, sx: EX, tl: EX + 32 };
+const MS = [10, 25, 50, 100, 150, 200, 300, 400, 500];
+const SUF = ["K","M","B","T","Qa","Qi","Sx","Sp","Oc","No","Dc"];
+const $ = s => document.querySelector(s);
+const fmt = n => {
+  if (n < 1000) return n < 10 ? (Math.round(n * 10) / 10) + "" : Math.floor(n) + "";
+  let i = -1; while (n >= 1000 && i < SUF.length - 1) { n /= 1000; i++; }
+  return n.toFixed(n < 10 ? 2 : n < 100 ? 1 : 0) + SUF[i];
+};
+const mult = l => 2 ** MS.filter(m => l >= m).length;
+const nextMs = l => MS.find(m => m > l);
+
+/* ---------- state ---------- */
+const mkShaft = () => ({ lvl: 1, mgr: 0, stock: 0, t: -1 });
+const fresh = (gems = 0, total = 0) => ({
+  cash: 30, run: 0, total, gems, boostT: 0,
+  shafts: [mkShaft()], cleared: {}, clr: null,
+  el: { lvl: 1, mgr: 0, t: -1, load: 0 },
+  wh: { lvl: 1, mgr: 0, t: -1, stock: 0, load: 0 },
+  ts: Date.now()
+});
+let S = fresh(), buyMode = 1, T = 0, floats = [], refs = [];
+const spawnAt = {};   // shaft index -> time T its elevator-shaft section was unlocked (drives the slide-in)
+
+const N = () => S.shafts.length;
+const gm = () => 1 + 0.2 * S.gems;
+const adm = () => S.boostT > 0 ? 2 : 1;
+const yieldS = i => 10 * B ** i * S.shafts[i].lvl * mult(S.shafts[i].lvl);
+const capE = () => 45 * S.el.lvl * mult(S.el.lvl) * B ** (N() - 1);
+const capW = () => 40 * S.wh.lvl * mult(S.wh.lvl) * B ** (N() - 1);
+const tripE = () => (N() * 0.8 + 1.2) / (1 + 0.03 * S.el.lvl);
+const cycW = () => 8 / (1 + 0.03 * S.wh.lvl);
+
+/* costs (cheap early game) */
+const costK = (c0, g, l, k) => c0 * g ** (l - 1) * (g ** k - 1) / (g - 1);
+function plan(c0, g, l) {
+  let k = buyMode;
+  if (buyMode === "max") { k = 0; while (k < 1000 && costK(c0, g, l, k + 1) <= S.cash) k++; k = Math.max(1, k); }
+  return { k, cost: costK(c0, g, l, k) };
+}
+const dept = (kind, i) =>
+  kind === "s" ? { o: S.shafts[i], c0: 20 * 5 ** i, g: 1.15, mc: 50 * 5 ** i }
+  : kind === "e" ? { o: S.el, c0: 30 * 3.5 ** (N() - 1), g: 1.16, mc: 80 }
+  : { o: S.wh, c0: 35 * 3.5 ** (N() - 1), g: 1.16, mc: 150 };
+const openCost = i => 80 * 5 ** (i - 1);                  // i = 0-based index of the shaft to open (i >= 1)
+
+/* obstacles: shafts 1-10 are free, then 11, 16, 21, 26 are blocked */
+const isObs = n => n > FREE && (n - FREE - 1) % 5 === 0;  // n = 1-based shaft number
+const blocked = i => isObs(i + 1) && !S.cleared[i + 1];
+const clearCost = n => Math.round(openCost(n - 1) * 0.5);
+const clearTime = n => 10 + (n - FREE - 1);               // 10s, 15s, 20s, 25s
+function status(i) {
+  if (i < N()) return "own";
+  if (i === N()) return blocked(i) ? (S.clr && S.clr.n === i + 1 ? "clearing" : "blocked") : "open";
+  return blocked(i) ? "farblock" : "locked";
+}
+
+/* ---------- economy ---------- */
+function rate() {
+  let sr = 0; S.shafts.forEach((s, i) => { if (s.mgr) sr += yieldS(i) / CYC; });
+  const er = S.el.mgr ? capE() / (2 * tripE()) : 0, wr = S.wh.mgr ? capW() / cycW() : 0;
+  return Math.min(sr, er, wr) * gm() * adm();
+}
+function earn(v) { S.cash += v; S.run += v; S.total += v; }
+function float(txt, x, y, col = "#ffd96b") { floats.push({ txt, x, y, t: 0, col }); }
+function startE() { if (S.el.t < 0 && S.shafts.some(s => s.stock > 0)) { S.el.t = 0; S.el.load = 0; } }
+function startW() { const W = S.wh; if (W.t < 0 && W.stock > 0) { W.load = Math.min(W.stock, capW()); W.stock -= W.load; W.t = 0; } }
+
+function tick(dt) {
+  T += dt;
+  if (S.boostT > 0) S.boostT = Math.max(0, S.boostT - dt);
+  if (S.clr) { S.clr.t += dt; if (S.clr.t >= S.clr.dur) { S.cleared[S.clr.n] = 1; S.clr = null; } }
+  S.shafts.forEach((s, i) => {
+    if (s.t < 0 && s.mgr) s.t = 0;
+    if (s.t >= 0) {
+      s.t += dt;
+      if (s.t >= CYC) { const y = yieldS(i); s.stock += y; float("+" + fmt(y), L.tl + 28, L.s0 + i * RH + 50, "#e8c27a"); s.t = s.mgr ? 0 : -1; }
+    }
+  });
+  const E = S.el, trip = tripE();
+  if (E.mgr) startE();
+  if (E.t >= 0) {
+    const prev = E.t; E.t += dt;
+    if (prev < trip) S.shafts.forEach((s, i) => {
+      const at = trip * (i + 1) / N();
+      if (prev < at && E.t >= at) { const take = Math.min(capE() - E.load, s.stock); s.stock -= take; E.load += take; }
+    });
+    if (E.t >= 2 * trip) { S.wh.stock += E.load; E.load = 0; E.t = -1; }
+  }
+  const W = S.wh;
+  if (W.mgr) startW();
+  if (W.t >= 0) {
+    const c = cycW(), prev = W.t; W.t += dt;
+    if (prev < c / 2 && W.t >= c / 2) {
+      const gain = W.load * gm() * adm(); earn(gain); W.load = 0;
+      const R = bRect(ART.warehouse); float("+$" + fmt(gain), R.x + R.w / 2, R.y + 6, "#9be27a");
+    }
+    if (W.t >= c) W.t = -1;
+  }
+  floats.forEach(f => f.t += dt); floats = floats.filter(f => f.t < 1.2);
+}
+
+/* ---------- actions ---------- */
+function tap(kind, i) {
+  gp(true);
+  if (kind === "s") {
+    if (i < N()) { const s = S.shafts[i]; if (s.t < 0) s.t = 0; }
+    else if (S.clr && S.clr.n === i + 1) S.clr.t += 0.5;   // tapping speeds up clearing
+  } else if (kind === "e") startE(); else startW();
+}
+function upgrade(kind, i) {
+  const d = dept(kind, i), p = plan(d.c0, d.g, d.o.lvl);
+  if (S.cash >= p.cost) { S.cash -= p.cost; d.o.lvl += p.k; }
+}
+function hire(kind, i) { const d = dept(kind, i); if (!d.o.mgr && S.cash >= d.mc) { S.cash -= d.mc; d.o.mgr = 1; } }
+function act(i) {
+  const st = status(i), n = i + 1;
+  if (st === "open" && N() < MAXS && S.cash >= openCost(i)) { S.cash -= openCost(i); S.shafts.push(mkShaft()); spawnAt[N() - 1] = T; }
+  else if (st === "blocked" && S.cash >= clearCost(n)) { S.cash -= clearCost(n); S.clr = { n, t: 0, dur: clearTime(n) }; }
+}
+const gain = () => Math.floor(Math.sqrt(S.run / 5e5));
+
+/* ---------- CrazyGames SDK (safe if missing) ---------- */
+const SDK = () => window.CrazyGames && window.CrazyGames.SDK;
+let sdkReady = false, playing = false;
+(async () => { try { await SDK().init(); sdkReady = true; SDK().game.loadingStop && SDK().game.loadingStop(); } catch (e) {} })();
+function gp(on) {
+  if (on === playing) return; playing = on;
+  try { if (sdkReady) on ? SDK().game.gameplayStart() : SDK().game.gameplayStop(); } catch (e) {}
+}
+function rewarded(done) {
+  if (!sdkReady) return done(); // local testing: grant directly
+  try { SDK().ad.requestAd("rewarded", { adStarted: () => gp(false), adFinished: () => { done(); gp(true); }, adError: () => gp(true) }); }
+  catch (e) { /* ad failed, no reward */ }
+}
+
+/* ---------- DOM: buttons live on the buildings / mining areas ---------- */
+const rowsEl = $("#rows"), mineEl = $("#mine"), world = $("#world"), cv = $("#cv"), g = cv.getContext("2d");
+function mkRow(kind, i, host) {     // host: reuse an existing row element (the elevator buttons live on the surface row)
+  const d = host || document.createElement("div"); if (!host) d.className = "row";
+  const r = { kind, i, d };
+  if (!host) d.onclick = kind === "w" ? ev => tap(surfaceHit(ev, d), 0) : () => tap(kind, i);
+  const grp = document.createElement("div"); grp.className = "grp g-" + kind;
+  grp.innerHTML = '<button class="up"></button><button class="mg"></button>';
+  r.grp = grp; r.up = grp.children[0]; r.mg = grp.children[1];
+  r.up.onclick = e => { e.stopPropagation(); upgrade(kind, i); };
+  r.mg.onclick = e => { e.stopPropagation(); hire(kind, i); };
+  d.appendChild(grp);
+  if (kind === "s") {
+    r.act = document.createElement("button"); r.act.className = "act";
+    r.act.onclick = e => { e.stopPropagation(); act(i); }; d.appendChild(r.act);
+  }
+  if (!host) rowsEl.appendChild(d); refs.push(r);
+}
+// a tap on the surface row goes to whichever building (elevator station / warehouse) is nearer
+function surfaceHit(ev, d) {
+  const x = ev.clientX - d.getBoundingClientRect().left, ER = bRect(ART.elevator), WR = bRect(ART.warehouse);
+  return x < (ER.x + ER.w + WR.x) / 2 ? "e" : "w";
+}
+function build() {
+  rowsEl.innerHTML = ""; refs = [];
+  mkRow("w", 0); mkRow("e", 0, refs[0].d);
+  for (let i = 0; i < MAXS; i++) mkRow("s", i);
+}
+function layout() {   // surface = SURF_FRAC of the viewport; the shafts start right below it
+  const vw = world.clientWidth;
+  const sh = Math.max(SURF_MIN, Math.round(mineEl.clientHeight * SURF_FRAC));
+  L.SH = L.s0 = sh;
+  const SI = ART.shaft.im;                                                             // elevator shaft width: from the section art if present
+  L.sw = SI && SI.ok ? Math.max(48, Math.min(Math.round(vw * 0.35), Math.round(levelH() * SI.naturalWidth / SI.naturalHeight)))
+                     : Math.max(64, Math.min(110, Math.round(vw * 0.1)));
+  L.sx = Math.max(EX, Math.round(L.sw / 2) + 10) + (vw >= 700 ? Math.round(vw * ELEV_SHIFT) : 0);   // elevator shaft centre
+  L.tl = L.sx + Math.round(L.sw / 2);
+  const r0 = refs[0]; if (r0 && r0.hh !== sh) { r0.hh = sh; r0.d.style.height = sh + "px"; }
+}
+const set = (el, t) => { if (el._t !== t) { el._t = t; el.innerHTML = t; } };
+const dis = (el, off) => el.classList.toggle("dis", !!off);
+function ui() {
+  set($("#cash"), "$" + fmt(S.cash) + '<span id="rate">≈ $' + fmt(rate()) + "/s auto" + (S.boostT > 0 ? " · 2x " + Math.ceil(S.boostT) + "s" : "") + "</span>");
+  set($("#bmode"), "Buy " + (buyMode === "max" ? "MAX" : "x" + buyMode));
+  const gn = gain();
+  set($("#bpre"), "Reinvest" + (gn ? " +" + gn + " ★" : "") + (S.gems ? " (★" + S.gems + ")" : ""));
+  dis($("#bpre"), !gn);
+  refs.forEach(r => {
+    const st = r.kind === "s" ? status(r.i) : "own";
+    r.grp.style.display = st === "own" ? "flex" : "none";
+    if (r.act) {
+      let t = "";
+      if (st === "open") t = "Open shaft " + (r.i + 1) + "<br>$" + fmt(openCost(r.i));
+      else if (st === "blocked") t = "Clear boulders<br>$" + fmt(clearCost(r.i + 1)) + " · " + clearTime(r.i + 1) + "s";
+      r.act.style.display = t ? "" : "none"; set(r.act, t);
+      dis(r.act, st === "open" ? S.cash < openCost(r.i) : S.cash < clearCost(r.i + 1));
+    }
+    if (st !== "own") return;
+    const d = dept(r.kind, r.i), o = d.o, p = plan(d.c0, d.g, o.lvl);
+    set(r.up, "Level +" + p.k + "<br>$" + fmt(p.cost)); dis(r.up, S.cash < p.cost);
+    set(r.mg, o.mgr ? "Auto ✓" : "Manager<br>$" + fmt(d.mc)); dis(r.mg, o.mgr || S.cash < d.mc);
+  });
+}
+
+/* ---------- drawing ---------- */
+function nugget(x, y, r) { g.fillStyle = "#ffc83d"; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill(); g.fillStyle = "#fff0a8"; g.beginPath(); g.arc(x - r / 3, y - r / 3, r / 3, 0, 7); g.fill(); }
+function boulder(x, y, r) { g.fillStyle = "#6f6a64"; g.beginPath(); g.ellipse(x, y, r, r * 0.8, 0, 0, 7); g.fill(); g.fillStyle = "#8d877f"; g.beginPath(); g.ellipse(x - r / 3, y - r / 3, r / 3, r / 4, 0, 0, 7); g.fill(); }
+function txt(s, x, y, size, col, al) { g.font = "bold " + size + "px 'Trebuchet MS',sans-serif"; g.textAlign = al || "left"; g.fillStyle = col; g.fillText(s, x, y); }
+function man(x, y, col, carry, ang) {
+  g.fillStyle = col; g.fillRect(x - 5, y - 22, 10, 16);
+  g.fillStyle = "#2a2a2a"; g.fillRect(x - 5, y - 6, 4, 6); g.fillRect(x + 1, y - 6, 4, 6);
+  g.fillStyle = "#f0c8a0"; g.fillRect(x - 4, y - 28, 8, 6);
+  g.fillStyle = "#f4c542"; g.beginPath(); g.arc(x, y - 27, 6, Math.PI, 0); g.fill();
+  if (ang !== null) { g.strokeStyle = "#d8d8d8"; g.lineWidth = 3; g.beginPath(); g.moveTo(x + 4, y - 16); g.lineTo(x + 4 + Math.cos(ang) * 16, y - 16 + Math.sin(ang) * 16); g.stroke(); }
+  if (carry) nugget(x - 8, y - 14, 5);
+}
+/* ================= SURFACE / BUILDING ART =================
+   Every image is optional: if a file is missing the old procedural drawing is used instead.
+   Buildings: x = left edge, bottom = ground line (game px, world coords), h = on-screen height;
+   width follows the image's aspect ratio. btn.dx / btn.dy nudge the button group (default: centred
+   horizontally, sitting near the bottom of the building). */
+const val = v => typeof v === "function" ? v() : v;
+const bH = () => Math.min(200, Math.max(96, Math.round(L.SH * 0.6)));   // both surface buildings share one height + baseline
+const levelH = () => RH + ART.tunnel.overlapV;   // drawn height of one level's tunnel AND its elevator-shaft section: one level + the overlap onto the next
+const ART = {
+  background: { src: ["img/background.png", "img/bg.png"], fit: "stretch" },   // fit: "stretch" (fill the surface) | "cover" (keep aspect, crop)
+  // both key buildings stand on the surface (row 0) on the same ground line: elevator station left, warehouse right (also the sell point)
+  warehouse:  { src: "img/warehouse.png", right: 10, bottom: () => L.SH, h: bH, fallbackAR: 262 / 96, maxW: 0.44, btn: { dx: 0, dy: 0 } },
+  elevator:   { src: "img/elevator_station.png", x: () => Math.max(4, L.sx - Math.round(L.sw / 2) - 4), bottom: () => L.SH, h: bH, fallbackAR: 250 / 90, maxW: 0.44, btn: { dx: 0, dy: 0 } },
+  // repeating tunnel section, drawn for every owned shaft. Scaled uniformly (aspect kept, never cropped) so its height is RH + overlapV:
+  // every tunnel overlaps the top of the one below by overlapV px (upper levels are drawn over lower ones) and no level leaves a gap.
+  // A tunnel is exactly `sections` sections long (sections past the screen edge are skipped, so phones show fewer), each section overlapping
+  // its neighbour by `overlap` px; the ore spot moves to the tunnel end when the tunnel is shorter than the screen.
+  // floor = px above a tunnel's bottom edge where the walking path is.
+  tunnel:     { src: ["img/tunnel_section.png", "img/tunnel.png"], sections: 10, overlap: 4, overlapV: 11, floor: 27 },
+  // elevator shaft section: generated with every level's row as the row's far-left anchor (same top and height as the row's tunnel sections,
+  // the first tunnel section overlaps it by tunnel.overlap px). Its aspect ratio sets the shaft width. A newly unlocked level's row
+  // slides/fades in over `spawn` seconds.
+  shaft:      { src: ["img/elevator_shaft_section.png", "img/elevator_section.png"], spawn: 0.45 },
+  // elevator cabin: drawn in front of the shaft sections, as wide as the shaft (fit = fraction of the shaft width), height from its aspect ratio
+  cabin:      { src: ["img/elevator_cabin.png", "img/elevator.png"], fit: 1 },
+  // ore spot where the miners dig (h = on-screen height, aspect kept, capped at maxW wide); sits just left of the button area
+  ore:        { src: ["img/ore_spot.png", "img/ore.png"], h: 78, maxW: 120 }
+};
+function loadImg(srcs) {
+  const list = [].concat(srcs); let i = 0; const im = new Image();
+  im.onload = () => { im.ok = true; };
+  im.onerror = () => { if (++i < list.length) im.src = list[i]; else console.warn("Image failed to load:", list.join(" / ")); };
+  im.src = list[0]; return im;
+}
+function drawCover(im, x, y, w, h) {   // fill w x h keeping the image's aspect ratio (any overflow is centre-cropped, never squashed)
+  const k = Math.max(w / im.naturalWidth, h / im.naturalHeight), sw = w / k, sh = h / k;
+  g.drawImage(im, (im.naturalWidth - sw) / 2, (im.naturalHeight - sh) / 2, sw, sh, x, y, w, h);
+}
+function initArt() { for (const k in ART) ART[k].im = loadImg(ART[k].src); }
+function bRect(c) {
+  const im = c.im, VW = world.clientWidth, ar = im && im.ok ? im.naturalWidth / im.naturalHeight : c.fallbackAR;
+  const right = c.right !== undefined;
+  let h = val(c.h), w = Math.round(h * ar);
+  const room = Math.max(60, Math.min(VW * c.maxW, right ? VW : VW - val(c.x) - 4));   // keep the building on screen, and the two buildings apart
+  if (w > room) { h = Math.round(h * room / w); w = Math.round(room); }
+  return { x: right ? VW - w - c.right : val(c.x), y: val(c.bottom) - h, w, h };
+}
+const BTN_W = 146, BTN_H = 40;   // 78 + 6 + 62 wide, min-height 40 (matches the CSS)
+function placeBtns(ref, c, r, rowTop) {
+  const l = Math.max(2, Math.min(world.clientWidth - BTN_W - 2, Math.round(r.x + (r.w - BTN_W) / 2 + c.btn.dx))), t = Math.round(r.y + r.h - BTN_H - 6 - rowTop + c.btn.dy);
+  const key = l + "," + t; if (ref.pos === key) return; ref.pos = key;
+  ref.grp.style.left = l + "px"; ref.grp.style.top = t + "px";
+}
+function plate(s, cx, y) {       // readable label on top of any artwork
+  g.font = "bold 12px 'Trebuchet MS',sans-serif"; const tw = g.measureText(s).width + 14;
+  g.fillStyle = "rgba(20,12,6,.62)"; g.beginPath();
+  if (g.roundRect) g.roundRect(cx - tw / 2, y - 13, tw, 19, 9); else g.rect(cx - tw / 2, y - 13, tw, 19);
+  g.fill(); txt(s, cx, y, 12, "#ffe9b0", "center");
+}
+
+/* ================= MINER SPRITES =================
+   One image per state, each a GRID of frames read left-to-right, top-to-bottom:
+   row = floor(frame / cols), col = frame % cols. Frame size is auto-detected from the image
+   (naturalWidth / cols, naturalHeight / rows), so sheets of different pixel sizes work together.
+   If an image is missing or fails to load, the built-in placeholder miner is drawn instead. */
+const MINER = {
+  lift: 0.4,                     // feet are raised by this fraction of the drawn frame height so miners stand on the tunnel path
+  drawH: 64,                     // on-screen height (game px) of one frame; width keeps the frame's aspect ratio
+  anchor: { x: 0.5, y: 0.95 },   // feet position inside a frame, as a fraction of frame width / height
+  facing: 1,                     // direction your art faces: 1 = right, -1 = left (drives the horizontal flip)
+  pixel: false,                  // true = crisp nearest-neighbour scaling for pixel art
+  scale: 1,                      // scale used only by the placeholder sheet
+  states: {
+    // optional per state: scale (multiplier), ax / ay (anchor override), fw / fh (force frame size in px)
+    idle:      { src: "img/miner_idle.png",       cols: 3, frames: 9,  fps: 8  },   // 3x3
+    walkEmpty: { src: "img/miner_walk_empty.png", cols: 4, frames: 16, fps: 10 },   // 4x4
+    mining:    { src: "img/miner_mining.png",     cols: 4, frames: 16, fps: 12 },   // 4x4
+    walkFull:  { src: "img/miner_walk_full.png",  cols: 4, frames: 16, fps: 10 }    // 4x4
+  }
+};
+const PH = { fw: 48, fh: 48, ax: 24, ay: 46, order: ["idle", "walkEmpty", "mining", "walkFull"], frames: { idle: 4, walkEmpty: 6, mining: 6, walkFull: 6 } };
+const sheets = {}; let phSheet = null;
+
+function initSprites() {
+  phSheet = genPlaceholder();
+  for (const k in MINER.states) {
+    const u = MINER.states[k].src; if (!u || sheets[u]) continue;
+    const im = new Image(); im.onload = () => { im.ok = true; }; im.onerror = () => console.warn("Miner sprite failed to load:", u);
+    im.src = u; sheets[u] = im;
+  }
+}
+/* Draw one frame. st = idle | walkEmpty | mining | walkFull, (x, y) = feet position, dir = +1 right / -1 left,
+   tin = seconds spent in this state (drives the frame index). */
+function drawMiner(st, x, y, dir, tin) {
+  const d = MINER.states[st], im = d.src && sheets[d.src];
+  let img = phSheet, sx, sy, fw = PH.fw, fh = PH.fh, ax = PH.ax, ay = PH.ay, sc = MINER.scale, facing = 1, fr;
+  if (im && im.ok) {                                          // real sprite sheet (grid)
+    const rows = d.rows || Math.ceil(d.frames / d.cols);
+    fw = d.fw || Math.floor(im.naturalWidth / d.cols); fh = d.fh || Math.floor(im.naturalHeight / rows);
+    fr = Math.floor(Math.max(0, tin) * d.fps) % d.frames;
+    sx = (fr % d.cols) * fw; sy = Math.floor(fr / d.cols) * fh;        // col = frame % cols, row = floor(frame / cols)
+    sc = MINER.drawH / fh * (d.scale || 1); ax = (d.ax ?? MINER.anchor.x) * fw; ay = (d.ay ?? MINER.anchor.y) * fh;
+    img = im; facing = MINER.facing;
+  } else {                                                    // placeholder: one row per state
+    fr = Math.floor(Math.max(0, tin) * d.fps) % PH.frames[st];
+    sx = fr * PH.fw; sy = PH.order.indexOf(st) * PH.fh;
+  }
+  g.imageSmoothingEnabled = !MINER.pixel;
+  y -= MINER.lift * fh * sc;                                  // lift the sprite (2/5 of its own height) onto the tunnel path
+  g.save(); g.translate(Math.round(x), Math.round(y));
+  if (dir * facing < 0) g.scale(-1, 1);                       // horizontal flip
+  g.drawImage(img, sx, sy, fw, fh, -ax * sc, -ay * sc, fw * sc, fh * sc);
+  g.restore();
+}
+/* Built-in placeholder: a 6x4 sheet drawn procedurally (art faces right) */
+function genPlaceholder() {
+  const c = document.createElement("canvas"); c.width = PH.fw * 6; c.height = PH.fh * 4; const k = c.getContext("2d");
+  PH.order.forEach((nm, row) => { for (let f = 0; f < PH.frames[nm]; f++) { k.save(); k.translate(f * PH.fw + PH.ax, row * PH.fh + PH.ay); pose(k, nm, f / PH.frames[nm]); k.restore(); } });
+  return c;
+}
+function pose(k, nm, ph) {
+  const s = Math.sin(ph * Math.PI * 2), walk = nm[0] === "w";
+  const bob = walk ? -Math.abs(s) * 2 : nm === "idle" ? -(s + 1) / 2 : 0, sw = walk ? s * 6 : 0;
+  k.fillStyle = "#2a2a2a"; k.fillRect(-5 + sw, -9, 4, 9); k.fillRect(1 - sw, -9, 4, 9);
+  if (nm === "walkFull") {                                    // ore bag on the back
+    k.fillStyle = "#8b5a2b"; k.beginPath(); k.arc(-8, -18 + bob, 7, 0, 7); k.fill();
+    k.fillStyle = "#ffc83d"; [[-10, -20], [-6, -17], [-9, -15]].forEach(p => { k.beginPath(); k.arc(p[0], p[1] + bob, 2, 0, 7); k.fill(); });
+  }
+  k.fillStyle = "#e07a2f"; k.fillRect(-6, -25 + bob, 12, 17);
+  k.fillStyle = "#f0c8a0"; k.fillRect(-3, -33 + bob, 8, 8);
+  k.fillStyle = "#f4c542"; k.beginPath(); k.arc(0, -32 + bob, 7, Math.PI, 0); k.fill(); k.fillRect(-7, -32 + bob, 14, 2);
+  k.fillStyle = "#fff6a0"; k.fillRect(4, -37 + bob, 3, 3);
+  const a = nm === "mining" ? -2.3 + (s + 1) / 2 * 2.5 : 1.2 + s * 0.5;   // arm angle
+  const hx = 2 + Math.cos(a) * 9, hy = -21 + bob + Math.sin(a) * 9;
+  k.lineCap = "round"; k.strokeStyle = "#e07a2f"; k.lineWidth = 4; k.beginPath(); k.moveTo(2, -21 + bob); k.lineTo(hx, hy); k.stroke();
+  if (nm !== "walkFull") {                                    // pickaxe
+    const b = a - 0.6, px = hx + Math.cos(b) * 9, py = hy + Math.sin(b) * 9;
+    k.strokeStyle = "#8b5a2b"; k.lineWidth = 2; k.beginPath(); k.moveTo(hx - Math.cos(b) * 3, hy - Math.sin(b) * 3); k.lineTo(px, py); k.stroke();
+    k.strokeStyle = "#cfcfcf"; k.lineWidth = 3; k.beginPath(); k.moveTo(px - Math.sin(b) * 5, py + Math.cos(b) * 5); k.lineTo(px + Math.sin(b) * 5, py - Math.cos(b) * 5); k.stroke();
+  }
+}
+
+function hint(x, y) { g.globalAlpha = 0.6 + Math.sin(T * 6) * 0.4; txt("TAP!", x, y, 15, "#fff", "center"); g.globalAlpha = 1; }
+
+function draw() {
+  layout();
+  const dpr = window.devicePixelRatio || 1, w = world.clientWidth, h = world.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); cv.style.width = w + "px"; cv.style.height = h + "px";
+  }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const SH = L.SH, SW = L.sw, sx = L.sx, tl = L.tl;
+  const base = tl + 68, wallX = Math.max(w - 158, tl + 118);   // wallX = start of the button area on the right of each tunnel
+  const TI = ART.tunnel.im, OI = ART.ore.im, FL = ART.tunnel.floor, OVV = ART.tunnel.overlapV;
+  /* tunnel sections: a fixed number per level, scaled to the level height (aspect kept), each overlapping its neighbour horizontally */
+  const NS = ART.tunnel.sections, OVL = ART.tunnel.overlap, areaW = w - 6 - tl;
+  const thD = RH + OVV;                                                              // drawn tunnel height: one level + the overlap onto the level below
+  const SI = ART.shaft.im, tx0 = tl - (SI.ok ? OVL : 0);                            // tx0: first tunnel section starts OVL px inside the elevator section
+  const tile = TI.ok ? thD * TI.naturalWidth / TI.naturalHeight : areaW / NS;        // section width
+  const tunEnd = TI.ok ? tx0 + (NS - 1) * (tile - OVL) + tile : w - 6;                // right end of the NS-section tunnel
+  const oreEdge = TI.ok ? Math.min(wallX, Math.round(tunEnd) - 6) : wallX;           // the ore spot never sits beyond the tunnel end
+  let oreX = wallX, ow = 0, oh = 0;                                // ore sprite rect (x, size); falls back to the procedural ore area
+  if (OI.ok) {
+    const w0 = ART.ore.h * OI.naturalWidth / OI.naturalHeight, room = oreEdge - (base + 46);
+    const k = Math.max(0.3, Math.min(1, ART.ore.maxW / w0, room / w0));
+    ow = Math.round(w0 * k); oh = Math.round(ART.ore.h * k); oreX = oreEdge - ow;
+  }
+  const dig = Math.max(oreX - (OI.ok ? 6 : 10), base + 40);        // x where the miners stand to dig
+
+  /* surface: background image (row 0, stretched across the full width) */
+  const bg = ART.background.im;
+  if (bg.ok) {
+    if (ART.background.fit === "cover") {
+      const k = Math.max(w / bg.naturalWidth, SH / bg.naturalHeight), dw = bg.naturalWidth * k, dh = bg.naturalHeight * k;
+      g.drawImage(bg, (w - dw) / 2, (SH - dh) / 2, dw, dh);
+    } else g.drawImage(bg, 0, 0, w, SH);
+  } else {
+    let sky = g.createLinearGradient(0, 0, 0, SH); sky.addColorStop(0, "#5fb4e6"); sky.addColorStop(1, "#d6f0ff");
+    g.fillStyle = sky; g.fillRect(0, 0, w, SH);
+    g.fillStyle = "#4f8a3a"; g.fillRect(0, SH - 20, w, 8); g.fillStyle = "#5a3d24"; g.fillRect(0, SH - 12, w, 12);
+  }
+  /* warehouse (right) and elevator station (left) share the surface ground line */
+  const WR = bRect(ART.warehouse), ER = bRect(ART.elevator);
+  if (ART.warehouse.im.ok) g.drawImage(ART.warehouse.im, WR.x, WR.y, WR.w, WR.h);
+  else { g.fillStyle = "#a0521d"; g.fillRect(WR.x + 6, WR.y + 4, WR.w - 12, WR.h - 8); g.fillStyle = "#6e2f0e"; g.fillRect(WR.x, WR.y, WR.w, 12); }
+  plate("Warehouse · Lv " + S.wh.lvl + (mult(S.wh.lvl) > 1 ? " ×" + mult(S.wh.lvl) : "") + " · $" + fmt(S.wh.stock), WR.x + WR.w / 2, WR.y + 17);
+  placeBtns(refs[0], ART.warehouse, WR, 0);
+  if (ART.elevator.im.ok) g.drawImage(ART.elevator.im, ER.x, ER.y, ER.w, ER.h);
+  else { g.fillStyle = "#6a4a30"; g.fillRect(ER.x, ER.y, ER.w, ER.h); g.fillStyle = "#8a6a46"; g.fillRect(ER.x + 6, ER.y + 6, ER.w - 12, ER.h - 12); }
+  plate("Elevator · Lv " + S.el.lvl + (mult(S.el.lvl) > 1 ? " ×" + mult(S.el.lvl) : "") + " · Load " + fmt(S.el.load), ER.x + ER.w / 2, ER.y + 17);
+  placeBtns(refs[1], ART.elevator, ER, 0);
+  // carrier: walks the ore from the elevator station to the warehouse (sell point) and back
+  const W = S.wh, c = cycW(), p = W.t < 0 ? 0 : W.t / c, wx0 = ER.x + ER.w - 6, wx1 = Math.max(WR.x + 4, wx0 + 30);
+  man(p < 0.5 ? wx0 + (wx1 - wx0) * p * 2 : wx1 - (wx1 - wx0) * (p - 0.5) * 2, SH - 20, "#3d6fd1", W.t >= 0 && p < 0.5, null);
+  if (W.t < 0 && !W.mgr && W.stock > 0) hint(Math.max(wx0 + 10, Math.min((wx0 + wx1) / 2, WR.x - 30)), SH - 66);
+  if (S.el.t < 0 && !S.el.mgr && S.shafts.some(s => s.stock > 0)) hint(ER.x + ER.w / 2, ER.y - 6);
+
+  /* underground backgrounds (the whole map is always visible) */
+  g.fillStyle = "#2d1f16"; g.fillRect(0, SH, w, MAXS * RH);
+  const lockedTop = L.s0 + N() * RH;
+  /* level rows. Every unlocked level is generated as ONE strip: the elevator shaft section is its left-most anchor and the NS tunnel sections
+     follow it, the first one starting OVL px inside the elevator section (horizontal overlap). All pieces share the row's top and height, and rows
+     are drawn bottom-to-top so each upper row overlaps the top of the one below (vertical overlap): no seams, gaps or misalignment anywhere. */
+  const hs = thD, dimTop = lockedTop + (SI.ok ? hs - RH : 0);
+  for (const k in spawnAt) if (+k >= N()) delete spawnAt[k];                         // forget levels lost to a reset
+  if (!SI.ok) {                                                                      // no shaft art: procedural chute column
+    g.fillStyle = "#150e0a"; g.fillRect(sx - SW / 2, SH, SW, lockedTop - SH);
+    g.fillStyle = "#6b4a2b"; for (let r = 1; r <= N(); r++) g.fillRect(sx - SW / 2, SH + r * RH - 3, SW, 5);    // cross braces at each level
+    g.strokeStyle = "#3a2a1e"; g.lineWidth = 3; g.beginPath();                                                  // guide rails
+    g.moveTo(sx - SW / 2 + 7, SH); g.lineTo(sx - SW / 2 + 7, lockedTop); g.moveTo(sx + SW / 2 - 7, SH); g.lineTo(sx + SW / 2 - 7, lockedTop); g.stroke();
+    g.strokeStyle = "#4a3426"; g.lineWidth = 2; g.strokeRect(sx - SW / 2, SH, SW, lockedTop - SH);
+  }
+  for (let i = N() - 1; i >= 0; i--) {
+    const y0 = L.s0 + i * RH; if (y0 + thD + 24 < mineEl.scrollTop || y0 > mineEl.scrollTop + mineEl.clientHeight) continue;
+    let sp = 1;
+    if (spawnAt[i] !== undefined) {                                                  // freshly unlocked level: the whole row slides/fades into place
+      sp = Math.min(1, (T - spawnAt[i]) / ART.shaft.spawn);
+      if (sp >= 1) delete spawnAt[i]; else sp = 1 - Math.pow(1 - sp, 3);
+    }
+    const yy = Math.round(y0 - (1 - sp) * 24); g.globalAlpha = sp;
+    if (SI.ok) drawCover(SI, Math.round(sx - SW / 2), yy, SW, thD);                  // 1) elevator shaft section: far-left anchor of the row
+    if (TI.ok) {                                                                     // 2) tunnel sections, each starting (tile - OVL) after the previous one
+      for (let j = 0; j < NS; j++) {
+        const xf = tx0 + j * (tile - OVL), x = Math.round(xf); if (x >= w) break;
+        g.drawImage(TI, x, yy, Math.round(xf + tile) - x, thD);
+      }
+    } else {                                                                         // procedural tunnel fallback
+      g.fillStyle = "#1f150f"; g.fillRect(tl, yy, w - tl - 6, thD);
+      g.fillStyle = "#6b4a2b"; for (let x = tl + 58; x < wallX - 30; x += 90) { g.fillRect(x, yy, 6, thD); g.fillRect(x - 6, yy, 18, 5); }
+      g.fillStyle = "#4a3426"; g.fillRect(tl, yy + thD - FL, w - tl - 6, 4);
+    }
+    g.globalAlpha = 1;
+  }
+
+  /* shaft rows (content on top of the tunnels) */
+  for (let i = 0; i < MAXS; i++) {
+    const y0 = L.s0 + i * RH, fl = y0 + thD - FL, st = status(i);
+    if (st !== "own") {
+      g.fillStyle = "rgba(20,18,16,.55)"; g.fillRect(0, y0, w, RH);
+      g.setLineDash([6, 6]); g.strokeStyle = st === "open" || st === "blocked" || st === "clearing" ? "#8a6a46" : "#4a3f36"; g.lineWidth = 2; g.strokeRect(tl + 4, y0 + 10, w - tl - 16, RH - 20); g.setLineDash([]);
+      const mx = (tl + w) / 2;
+      if (st === "farblock" || st === "blocked" || st === "clearing") {
+        for (let k = 0; k < 7; k++) boulder(tl + 40 + k * Math.max(26, (w - tl - 90) / 7), y0 + 70 - (k % 2) * 14, 16 + (k % 3) * 3);
+        if (st === "farblock") txt("Shaft " + (i + 1) + " · Blocked by boulders", mx, y0 + 28, 13, "#bdb5aa", "center");
+        else if (st === "blocked") txt("Shaft " + (i + 1) + " · Blocked", mx, y0 + 20, 13, "#e8c27a", "center");
+      } else txt("Shaft " + (i + 1) + " · Unexplored rock", mx, y0 + (st === "open" ? 20 : 54), 13, st === "open" ? "#e8c27a" : "#7a6e62", "center");
+      if (st === "clearing") {
+        const bw = Math.min(220, w - 120), f = S.clr.t / S.clr.dur;
+        g.fillStyle = "#150e0a"; g.fillRect(mx - bw / 2, y0 + 36, bw, 18); g.fillStyle = "#ffc83d"; g.fillRect(mx - bw / 2, y0 + 36, bw * f, 18);
+        txt("Clearing… " + Math.ceil(S.clr.dur - S.clr.t) + "s · tap to speed up", mx, y0 + 70, 12, "#fff", "center");
+      }
+      continue;
+    }
+    const s = S.shafts[i], vis = y0 + RH > mineEl.scrollTop && y0 < mineEl.scrollTop + mineEl.clientHeight;
+    // ore spot where the miner digs (the upgrade/manager buttons sit to its right)
+    if (OI.ok) { if (vis) g.drawImage(OI, oreX, fl + 2 - oh, ow, oh); }
+    else {
+      g.fillStyle = "#3d2c1f"; g.fillRect(wallX, y0 + 8, w - wallX - 6, RH - 14);
+      for (let k = 0; k < 16; k++) nugget(wallX + 8 + (k * 37 + i * 11) % 140, y0 + 16 + (k * 23 + i * 7) % 72, 3 + (k % 3));
+    }
+    txt("Shaft " + (i + 1), tl + 8, y0 + 26, 12, "#e8c27a");
+    txt("Lv " + s.lvl + (mult(s.lvl) > 1 ? " ×" + mult(s.lvl) : ""), tl + 8, y0 + 40, 11, "#cdb48a");
+    const n = Math.min(7, Math.ceil(s.stock / yieldS(i) * 2));
+    for (let k = 0; k < (s.stock > 0 ? n : 0); k++) nugget(tl + 12 + (k % 4) * 8, fl - 4 - Math.floor(k / 4) * 8, 4.5);
+    if (s.stock > 0) txt(fmt(s.stock), tl + 22, fl - 28, 11, "#ffd96b", "center");
+    // miner state machine: idle -> walkEmpty -> mining -> walkFull -> idle (drop-off)
+    const pp = s.t < 0 ? 0 : s.t / CYC; let mx2 = base, ms = "idle", dir = 1, t0 = 0;
+    if (s.t >= 0 && pp < 0.25) { ms = "walkEmpty"; mx2 = base + (dig - base) * pp / 0.25; }
+    else if (pp >= 0.25 && pp < 0.65) { ms = "mining"; mx2 = dig; t0 = 0.25; }
+    else if (pp >= 0.65 && pp < 0.9) { ms = "walkFull"; dir = -1; mx2 = dig - (dig - base) * (pp - 0.65) / 0.25; t0 = 0.65; }
+    drawMiner(ms, mx2, fl, dir, ms === "idle" ? T + i * 0.37 : (pp - t0) * CYC);
+    if (s.t < 0 && !s.mgr) hint(Math.max(base + 20, oreX - 60), y0 + 34);
+  }
+
+  /* dim the undug part of the elevator column */
+  g.fillStyle = "#0e0a07"; g.fillRect(sx - SW / 2, dimTop, SW, MAXS * RH - N() * RH - (dimTop - lockedTop));
+
+  /* hoist wheel (on the station), cable and cabin. The cabin is drawn after (in front of) every shaft section, tunnel and row */
+  const a = T * (S.el.t < 0 ? 0 : 5), wy = ER.y + 24;
+  g.strokeStyle = "#ffc83d"; g.lineWidth = 3; g.beginPath(); g.arc(sx, wy, 12, 0, 7); g.moveTo(sx + Math.cos(a) * 12, wy + Math.sin(a) * 12); g.lineTo(sx - Math.cos(a) * 12, wy - Math.sin(a) * 12); g.stroke();
+  const E = S.el, trip = tripE(), f = E.t < 0 ? 0 : E.t < trip ? E.t / trip : 1 - (E.t - trip) / trip;
+  const cb = L.s0 - 14 + f * N() * RH + (thD - FL - RH + 10) * Math.min(1, f * N()), CI = ART.cabin.im;
+  let cw = Math.max(28, SW - 18), ch = 24;                                           // cabin size (procedural default 24 tall)
+  if (CI.ok) { cw = Math.round(SW * ART.cabin.fit); ch = Math.round(cw * CI.naturalHeight / CI.naturalWidth); }   // spans the shaft channel
+  const ct = cb - 2 - ch;                                                            // cabin top; its bottom rests at cb - 2
+  if (wy + 12 < ct) { g.strokeStyle = "#999"; g.lineWidth = 1.5; g.beginPath(); g.moveTo(sx, wy + 12); g.lineTo(sx, ct); g.stroke(); }
+  if (CI.ok) g.drawImage(CI, Math.round(sx - cw / 2), ct, cw, ch);
+  else { g.fillStyle = "#c0392b"; g.fillRect(sx - cw / 2, ct, cw, ch); g.fillStyle = "#222"; g.fillRect(sx - cw / 2 + 4, ct + 4, cw - 8, 12); }
+  for (let k = 0; k < (E.load > 0 ? 4 : 0); k++) nugget(sx - cw / 2 + cw * (k + 1) / 5, ct + ch * 0.55, 3);
+
+  /* floating texts */
+  floats.forEach(fl => { g.globalAlpha = Math.max(0, 1 - fl.t / 1.2); txt(fl.txt, fl.x, fl.y - fl.t * 30, 14, fl.col, "center"); });
+  g.globalAlpha = 1;
+}
+
+/* ---------- modal & HUD ---------- */
+function modal(html, btns) {
+  const b = $("#box"); b.innerHTML = html + '<div class="bt"></div>';
+  btns.forEach(([t, cls, fn]) => { const e = document.createElement("button"); e.innerHTML = t; if (cls) e.className = cls; e.onclick = () => { $("#modal").classList.remove("on"); fn && fn(); }; b.lastChild.appendChild(e); });
+  $("#modal").classList.add("on");
+}
+$("#bmode").onclick = () => { buyMode = { 1: 10, 10: 100, 100: "max", max: 1 }[buyMode]; };
+$("#bad").onclick = () => rewarded(() => { S.boostT = 120; });
+$("#bpre").onclick = () => {
+  const n = gain(); if (!n) return;
+  modal("<h2>Reinvest in the mine?</h2><div>You restart with $30 and a single shaft, but gain <b>" + n + " ★</b>. Each star adds +20% to all cash you earn, forever.</div>",
+    [["Reinvest", "alt", () => { S = fresh(S.gems + n, S.total); save(); }], ["Keep digging", "", null]]);
+};
+
+/* ---------- save / offline ---------- */
+function save() { try { S.ts = Date.now(); localStorage.setItem(SAVE, JSON.stringify(S)); } catch (e) {} }
+function load() {
+  try {
+    const d = JSON.parse(localStorage.getItem(SAVE));
+    if (d && d.shafts && d.shafts.length) { S = Object.assign(fresh(), d); S.shafts.forEach(s => s.t = -1); S.el.t = -1; S.wh.t = -1; if (!S.cleared) S.cleared = {}; }
+  } catch (e) {}
+}
+function offline(secs) {
+  secs = Math.min(secs, 4 * 3600);
+  S.boostT = Math.max(0, S.boostT - secs);
+  const v = rate() * secs;
+  if (secs < 30 || v <= 0) return;
+  modal("<h2>Welcome back!</h2><div>Your managers mined for " + Math.floor(secs / 60) + " min and earned <b>$" + fmt(v) + "</b>.</div>",
+    [["Collect", "", () => earn(v)], ["Collect 2x (ad)", "alt", () => rewarded(() => earn(v * 2))]]);
+}
+let hiddenAt = 0;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { hiddenAt = Date.now(); save(); gp(false); }
+  else if (hiddenAt) { const s = (Date.now() - hiddenAt) / 1000; hiddenAt = 0; if (s > 5) offline(s); }
+});
+setInterval(save, 5000); window.addEventListener("beforeunload", save);
+
+/* ---------- boot ---------- */
+initArt(); initSprites(); load(); build(); layout();
+offline((Date.now() - S.ts) / 1000);
+let last = performance.now();
+(function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  tick(dt); ui(); draw(); requestAnimationFrame(loop);
+})(last);
+</script>
+</body>
+</html>
